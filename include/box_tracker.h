@@ -96,11 +96,19 @@ struct TrackerConfig {
 
   // Box tracking behavior.
   float min_inlier_ratio = 0.15f;
-  float spring_force = 0.1f;
+  float spring_force = 0.15f;              // Increased from 0.1
   float confidence_decay = 0.9f;
+  
+  // Stage 1 improvements: Adaptive spring force
+  float spring_force_max = 0.25f;          // Maximum spring force
+  float spring_force_min = 0.05f;          // Minimum spring force
+  bool adaptive_spring_force = true;       // Enable adaptive spring force
+  
+  // Stage 1 improvements: Temporal smoothing
+  float temporal_smoothing_weight = 0.3f;  // History weight for smoothing
 
   // Forward-backward verification threshold (pixels).
-  float fb_verify_threshold = 2.0f;
+  float fb_verify_threshold = 1.5f;        // Decreased from 2.0 for stricter validation
 };
 
 // Computes optical flow features between frames.

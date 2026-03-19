@@ -413,19 +413,51 @@ float MotionBoxTracker::ScoreInliers(
   if (inliers > 0) {
     inlier_center *= (1.0f / inliers);
 
+    // ===== Stage 1 Improvement: Temporal Smoothing =====
+    // Get previous inlier center (use box center as proxy for history)
+    cv::Point2f prev_inlier_center = state_.center();
+    
+    // Calculate relative change in inlier center
+    float box_size = std::max(0.01f, std::max(state_.width, state_.height));
+    float rel_change = cv::norm(inlier_center - prev_inlier_center) / box_size;
+    
+    // Dynamic blending based on change magnitude
+    // Small change -> more history (smooth), Large change -> more current (responsive)
+    float blend_weight = std::min(0.5f, rel_change * 2.0f);
+    blend_weight = std::max(0.1f, blend_weight);  // At least 10% history
+    
+    // Apply temporal smoothing using configured weight
+    float smooth_weight = std::min(blend_weight, config_.temporal_smoothing_weight);
+    inlier_center = (1.0f - smooth_weight) * inlier_center + 
+                    smooth_weight * prev_inlier_center;
+    // ===== End Temporal Smoothing =====
+
     // Confidence based on inlier ratio and count.
     float inlier_ratio =
         static_cast<float>(inliers) / std::max(1, (int)vectors.size());
     confidence = std::min(1.0f, inlier_ratio / config_.min_inlier_ratio);
 
-    // Apply spring force toward inlier center.
+    // ===== Stage 1 Improvement: Adaptive Spring Force =====
     cv::Point2f box_center = next_state.center();
     cv::Point2f diff = inlier_center - box_center;
     float diff_mag = cv::norm(diff);
+    
     if (diff_mag > 0.01f) {
-      next_state.x += diff.x * config_.spring_force;
-      next_state.y += diff.y * config_.spring_force;
+      // Calculate adaptive spring force based on confidence
+      float spring_force = config_.spring_force;
+      
+      if (config_.adaptive_spring_force) {
+        // Low confidence -> stronger pull back; High confidence -> gentle correction
+        float confidence_factor = 1.0f - confidence;  // 0 = high conf, 1 = low conf
+        spring_force = config_.spring_force_min + 
+                      (config_.spring_force_max - config_.spring_force_min) * 
+                      confidence_factor;
+      }
+      
+      next_state.x += diff.x * spring_force;
+      next_state.y += diff.y * spring_force;
     }
+    // ===== End Adaptive Spring Force =====
   }
 
   return confidence;
