@@ -7,6 +7,10 @@
 #include <cmath>
 #include <numeric>
 
+#ifdef USE_EIGEN3
+#include <Eigen/Dense>
+#endif
+
 namespace tracking {
 
 // ============================================================================
@@ -20,6 +24,7 @@ void FlowComputation::Reset() {
   prev_gray_ = cv::Mat();
   prev_points_.clear();
   prev_track_ids_.clear();
+  prev_track_lengths_.clear();
   has_prev_ = false;
   next_track_id_ = 0;
 }
@@ -60,6 +65,7 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     gray_frame.copyTo(prev_gray_);
     ExtractGridFeatures(prev_gray_, prev_points_);
     prev_track_ids_.resize(prev_points_.size());
+    prev_track_lengths_.resize(prev_points_.size(), 0);
     for (size_t i = 0; i < prev_points_.size(); ++i) {
       prev_track_ids_[i] = next_track_id_++;
     }
@@ -71,6 +77,7 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     gray_frame.copyTo(prev_gray_);
     ExtractGridFeatures(prev_gray_, prev_points_);
     prev_track_ids_.resize(prev_points_.size());
+    prev_track_lengths_.resize(prev_points_.size(), 0);
     for (size_t i = 0; i < prev_points_.size(); ++i) {
       prev_track_ids_[i] = next_track_id_++;
     }
@@ -111,6 +118,14 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     feat.track_id = prev_track_ids_[i];
     feat.irls_weight = 1.0f;
     feat.is_inlier = true;
+    
+    // Stage 2: Update track length and apply length-based weighting.
+    feat.track_length = prev_track_lengths_[i] + 1;
+    if (feat.track_length > config_.max_track_length) {
+      // Reduce weight for overly long tracks to prevent drift.
+      feat.irls_weight *= 0.5f;
+    }
+    
     result.push_back(feat);
   }
 
@@ -151,10 +166,12 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
   // Keep tracked points and add new features in empty grid cells.
   std::vector<cv::Point2f> kept_points;
   std::vector<int> kept_ids;
+  std::vector<int> kept_lengths;
   for (const auto& f : result) {
     if (f.is_inlier) {
       kept_points.push_back(f.position);
       kept_ids.push_back(f.track_id);
+      kept_lengths.push_back(f.track_length);
     }
   }
 
@@ -177,12 +194,14 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     if (!too_close && kept_points.size() < static_cast<size_t>(config_.max_features)) {
       kept_points.push_back(nf);
       kept_ids.push_back(next_track_id_++);
+      kept_lengths.push_back(0);  // New features start with length 0.
     }
   }
 
   gray_frame.copyTo(prev_gray_);
   prev_points_ = kept_points;
   prev_track_ids_ = kept_ids;
+  prev_track_lengths_ = kept_lengths;
 
   return result;
 }
@@ -388,6 +407,108 @@ cv::Point2f MotionBoxTracker::EstimateTranslation(
   return translation;
 }
 
+// Stage 3: Estimate similarity transform (optional, conservative implementation).
+SimilarityTransform MotionBoxTracker::EstimateSimilarity(
+    const std::vector<const MotionVector*>& vectors,
+    const std::vector<float>& prior_weights, std::vector<float>& weights) {
+  const int n = vectors.size();
+  
+  SimilarityTransform result;
+  result.translation = cv::Point2f(0, 0);
+  result.scale = 1.0f;
+  result.rotation = 0.0f;
+  
+  // Need at least 3 points for similarity estimation.
+  if (n < 3) {
+    // Fallback to translation.
+    result.translation = EstimateTranslation(vectors, prior_weights, weights);
+    return result;
+  }
+  
+  weights = prior_weights;
+  
+  // Use OpenCV's estimateAffinePartial2D for robust similarity estimation.
+  // This is more stable than manual least squares.
+  std::vector<cv::Point2f> src_pts, dst_pts;
+  std::vector<float> point_weights;
+  
+  for (int i = 0; i < n; ++i) {
+    if (prior_weights[i] > 0.01f) {  // Only use weighted points.
+      src_pts.push_back(vectors[i]->pos);
+      dst_pts.push_back(vectors[i]->pos + vectors[i]->object);
+      point_weights.push_back(prior_weights[i]);
+    }
+  }
+  
+  if (src_pts.size() < 3) {
+    // Fallback to translation.
+    result.translation = EstimateTranslation(vectors, prior_weights, weights);
+    return result;
+  }
+  
+  // Estimate similarity transform using OpenCV (robust).
+  cv::Mat inliers_mask;
+  cv::Mat transform_mat = cv::estimateAffinePartial2D(
+      src_pts, dst_pts, inliers_mask, cv::RANSAC, 
+      0.02);  // 2% threshold in normalized coordinates
+  
+  if (transform_mat.empty() || transform_mat.rows != 2 || transform_mat.cols != 3) {
+    // Estimation failed, fallback to translation.
+    result.translation = EstimateTranslation(vectors, prior_weights, weights);
+    return result;
+  }
+  
+  // Extract similarity parameters from affine matrix.
+  // [a -b tx]
+  // [b  a ty]
+  float a = transform_mat.at<double>(0, 0);
+  float b = transform_mat.at<double>(1, 0);
+  float tx = transform_mat.at<double>(0, 2);
+  float ty = transform_mat.at<double>(1, 2);
+  
+  result.scale = std::sqrt(a * a + b * b);
+  result.rotation = std::atan2(b, a);
+  result.translation = cv::Point2f(tx, ty);
+  
+  // Apply constraints.
+  if (config_.allow_scale) {
+    result.scale = std::max(config_.min_scale, 
+                           std::min(config_.max_scale, result.scale));
+  } else {
+    result.scale = 1.0f;
+  }
+  
+  if (!config_.allow_rotation) {
+    result.rotation = 0.0f;
+  }
+  
+  // Additional safety: if rotation or scale is too extreme, fallback.
+  if (std::abs(result.rotation) > M_PI / 3 ||  // > 60 degrees
+      result.scale < 0.5f || result.scale > 2.0f) {
+    result.translation = EstimateTranslation(vectors, prior_weights, weights);
+    result.scale = 1.0f;
+    result.rotation = 0.0f;
+    return result;
+  }
+  
+  // Update weights based on transform (simple version).
+  for (int i = 0; i < n; ++i) {
+    weights[i] = prior_weights[i];
+  }
+  
+  return result;
+}
+
+// Stage 3: Score inliers for similarity transform.
+float MotionBoxTracker::ScoreInliersSimilarity(
+    const std::vector<const MotionVector*>& vectors,
+    const std::vector<float>& weights, const SimilarityTransform& transform,
+    BoxState& next_state) {
+  // For simplicity and stability, use the same scoring as translation.
+  // The transform has already been applied to the box.
+  return ScoreInliers(vectors, weights, transform.translation, next_state);
+}
+
 float MotionBoxTracker::ScoreInliers(
     const std::vector<const MotionVector*>& vectors,
     const std::vector<float>& weights, const cv::Point2f& translation,
@@ -395,6 +516,15 @@ float MotionBoxTracker::ScoreInliers(
   int inliers = 0;
   float inlier_sum = 0;
   cv::Point2f inlier_center(0, 0);
+  
+  // Stage 2: Initialize spatial prior grid if enabled.
+  cv::Mat density_map;
+  if (config_.use_spatial_prior) {
+    if (next_state.inlier_density_map.empty()) {
+      next_state.inlier_density_map = cv::Mat::zeros(3, 3, CV_32F);
+    }
+    density_map = cv::Mat::zeros(3, 3, CV_32F);
+  }
 
   for (size_t i = 0; i < vectors.size(); ++i) {
     float residual = cv::norm(vectors[i]->object - translation);
@@ -404,6 +534,16 @@ float MotionBoxTracker::ScoreInliers(
       ++inliers;
       inlier_sum += weights[i];
       inlier_center += vectors[i]->pos;
+      
+      // Stage 2: Update spatial density grid.
+      if (config_.use_spatial_prior && !density_map.empty()) {
+        cv::Point2f rel_pos = vectors[i]->pos - cv::Point2f(next_state.x, next_state.y);
+        int grid_x = std::min(2, std::max(0, int(rel_pos.x / next_state.width * 3)));
+        int grid_y = std::min(2, std::max(0, int(rel_pos.y / next_state.height * 3)));
+        if (grid_x >= 0 && grid_x < 3 && grid_y >= 0 && grid_y < 3) {
+          density_map.at<float>(grid_y, grid_x) += weights[i];
+        }
+      }
     }
   }
 
@@ -412,19 +552,54 @@ float MotionBoxTracker::ScoreInliers(
 
   if (inliers > 0) {
     inlier_center *= (1.0f / inliers);
+    
+    // Stage 2: Temporal smoothing of inlier center.
+    cv::Point2f prev_center = state_.prev_inlier_center;
+    if (prev_center.x != 0 || prev_center.y != 0) {
+      // Calculate change in inlier center (normalized).
+      float rel_change = cv::norm(inlier_center - prev_center) / 
+                        std::max(0.01f, std::max(state_.width, state_.height));
+      
+      // Dynamic blending: small change -> more history; large change -> more current.
+      float blend_weight = std::min(0.5f, rel_change * 2.0f);
+      blend_weight = std::max(0.1f, blend_weight);
+      
+      // Mix current and historical inlier center.
+      inlier_center = (1.0f - blend_weight) * inlier_center + 
+                      blend_weight * prev_center;
+    }
+    
+    // Store current inlier center for next frame.
+    next_state.prev_inlier_center = inlier_center;
+    
+    // Stage 2: Update spatial prior with temporal blending.
+    if (config_.use_spatial_prior && !density_map.empty()) {
+      next_state.inlier_density_map = 0.7f * density_map + 
+                                      0.3f * next_state.inlier_density_map;
+    }
 
     // Confidence based on inlier ratio and count.
     float inlier_ratio =
         static_cast<float>(inliers) / std::max(1, (int)vectors.size());
     confidence = std::min(1.0f, inlier_ratio / config_.min_inlier_ratio);
 
+    // Stage 2: Adaptive spring force based on confidence.
+    float spring_force = config_.spring_force;
+    if (config_.adaptive_spring_force) {
+      // Low confidence -> stronger pull; high confidence -> gentle correction.
+      float confidence_factor = 1.0f - confidence;
+      spring_force = config_.spring_force_min + 
+                    (config_.spring_force_max - config_.spring_force_min) * 
+                    confidence_factor;
+    }
+    
     // Apply spring force toward inlier center.
     cv::Point2f box_center = next_state.center();
     cv::Point2f diff = inlier_center - box_center;
     float diff_mag = cv::norm(diff);
     if (diff_mag > 0.01f) {
-      next_state.x += diff.x * config_.spring_force;
-      next_state.y += diff.y * config_.spring_force;
+      next_state.x += diff.x * spring_force;
+      next_state.y += diff.y * spring_force;
     }
   }
 
@@ -456,19 +631,53 @@ BoxState MotionBoxTracker::TrackStep(const FrameTrackingData& data,
   // Step 2: RANSAC initialization.
   RansacTranslationInit(selected, prior_weights);
 
-  // Step 3: IRLS translation estimation.
+  // Step 3 & 4: Motion estimation and application.
   std::vector<float> weights;
-  cv::Point2f translation =
-      EstimateTranslation(selected, prior_weights, weights);
-
-  // Step 4: Apply motion to box.
-  next_state.x += translation.x;
-  next_state.y += translation.y;
-  next_state.dx = translation.x;
-  next_state.dy = translation.y;
-
-  // Step 5: Score inliers and compute confidence.
-  float confidence = ScoreInliers(selected, weights, translation, next_state);
+  float confidence = 0;
+  
+  if (config_.motion_model == TrackerConfig::MotionModel::SIMILARITY &&
+      selected.size() >= 3) {
+    // Stage 3: Use similarity transform (translation + rotation + scale).
+    SimilarityTransform transform =
+        EstimateSimilarity(selected, prior_weights, weights);
+    
+    // Apply scale (only if reasonable change).
+    if (config_.allow_scale && 
+        std::abs(transform.scale - 1.0f) < 0.3f) {  // Max 30% change per frame.
+      next_state.width *= transform.scale;
+      next_state.height *= transform.scale;
+      next_state.scale = transform.scale;
+    }
+    
+    // Apply rotation (only if small).
+    if (config_.allow_rotation && 
+        std::abs(transform.rotation) < M_PI / 6) {  // Max 30 degrees per frame.
+      next_state.rotation += transform.rotation;
+    }
+    
+    // Apply translation.
+    next_state.x += transform.translation.x;
+    next_state.y += transform.translation.y;
+    next_state.dx = transform.translation.x;
+    next_state.dy = transform.translation.y;
+    
+    // Score inliers.
+    confidence = ScoreInliersSimilarity(selected, weights, transform, next_state);
+  } else {
+    // Default: Use translation-only model (stable).
+    cv::Point2f translation =
+        EstimateTranslation(selected, prior_weights, weights);
+    
+    // Apply translation to box.
+    next_state.x += translation.x;
+    next_state.y += translation.y;
+    next_state.dx = translation.x;
+    next_state.dy = translation.y;
+    
+    // Score inliers.
+    confidence = ScoreInliers(selected, weights, translation, next_state);
+  }
+  
   next_state.confidence = confidence;
   next_state.tracked = (confidence > 0.1f);
 
