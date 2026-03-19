@@ -527,7 +527,11 @@ SimilarityTransform MotionBoxTracker::EstimateSimilarity(
     cv::Mat solution;
     if (!cv::solve(A, b, solution, cv::DECOMP_QR)) {
       // Fallback to translation-only if solve fails.
-      return EstimateTranslation(vectors, prior_weights, weights);
+      cv::Point2f trans = EstimateTranslation(vectors, prior_weights, weights);
+      result.translation = trans;
+      result.scale = 1.0f;
+      result.rotation = 0.0f;
+      return result;
     }
     
     float a = solution.at<float>(0);
