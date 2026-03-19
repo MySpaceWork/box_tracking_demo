@@ -719,6 +719,15 @@ float MotionBoxTracker::ScoreInliers(
   int inliers = 0;
   float inlier_sum = 0;
   cv::Point2f inlier_center(0, 0);
+  
+  // Stage 2: Initialize spatial prior grid if enabled.
+  cv::Mat density_map;
+  if (config_.use_spatial_prior) {
+    if (next_state.inlier_density_map.empty()) {
+      next_state.inlier_density_map = cv::Mat::zeros(3, 3, CV_32F);
+    }
+    density_map = cv::Mat::zeros(3, 3, CV_32F);
+  }
 
   for (size_t i = 0; i < vectors.size(); ++i) {
     float residual = cv::norm(vectors[i]->object - translation);
@@ -728,6 +737,16 @@ float MotionBoxTracker::ScoreInliers(
       ++inliers;
       inlier_sum += weights[i];
       inlier_center += vectors[i]->pos;
+      
+      // Stage 2: Update spatial density grid.
+      if (config_.use_spatial_prior && !density_map.empty()) {
+        cv::Point2f rel_pos = vectors[i]->pos - cv::Point2f(next_state.x, next_state.y);
+        int grid_x = std::min(2, std::max(0, int(rel_pos.x / next_state.width * 3)));
+        int grid_y = std::min(2, std::max(0, int(rel_pos.y / next_state.height * 3)));
+        if (grid_x >= 0 && grid_x < 3 && grid_y >= 0 && grid_y < 3) {
+          density_map.at<float>(grid_y, grid_x) += weights[i];
+        }
+      }
     }
   }
 
@@ -736,19 +755,55 @@ float MotionBoxTracker::ScoreInliers(
 
   if (inliers > 0) {
     inlier_center *= (1.0f / inliers);
+    
+    // Stage 2: Temporal smoothing of inlier center.
+    cv::Point2f prev_center = state_.prev_inlier_center;
+    float prev_mag = cv::norm(prev_center);
+    if (prev_mag > 0.001f) {  // Check if prev_center was initialized.
+      // Calculate change in inlier center (normalized).
+      float rel_change = cv::norm(inlier_center - prev_center) / 
+                        std::max(0.01f, std::max(state_.width, state_.height));
+      
+      // Dynamic blending: small change -> more history; large change -> more current.
+      float blend_weight = std::min(0.5f, rel_change * 2.0f);
+      blend_weight = std::max(0.1f, blend_weight);
+      
+      // Mix current and historical inlier center.
+      inlier_center = (1.0f - blend_weight) * inlier_center + 
+                      blend_weight * prev_center;
+    }
+    
+    // Store current inlier center for next frame.
+    next_state.prev_inlier_center = inlier_center;
+    
+    // Stage 2: Update spatial prior with temporal blending.
+    if (config_.use_spatial_prior && !density_map.empty()) {
+      next_state.inlier_density_map = 0.7f * density_map + 
+                                      0.3f * next_state.inlier_density_map;
+    }
 
     // Confidence based on inlier ratio and count.
     float inlier_ratio =
         static_cast<float>(inliers) / std::max(1, (int)vectors.size());
     confidence = std::min(1.0f, inlier_ratio / config_.min_inlier_ratio);
 
+    // Stage 2: Adaptive spring force based on confidence.
+    float spring_force = config_.spring_force;
+    if (config_.adaptive_spring_force) {
+      // Low confidence -> stronger pull; high confidence -> gentle correction.
+      float confidence_factor = 1.0f - confidence;
+      spring_force = config_.spring_force_min + 
+                    (config_.spring_force_max - config_.spring_force_min) * 
+                    confidence_factor;
+    }
+    
     // Apply spring force toward inlier center.
     cv::Point2f box_center = next_state.center();
     cv::Point2f diff = inlier_center - box_center;
     float diff_mag = cv::norm(diff);
     if (diff_mag > 0.01f) {
-      next_state.x += diff.x * config_.spring_force;
-      next_state.y += diff.y * config_.spring_force;
+      next_state.x += diff.x * spring_force;
+      next_state.y += diff.y * spring_force;
     }
   }
 
