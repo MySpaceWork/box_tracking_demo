@@ -254,6 +254,15 @@ void MotionBoxTracker::Init(const BoxState& initial_state) {
   state_ = initial_state;
   state_.tracked = true;
   state_.confidence = 1.0f;
+  
+  // Initialize prev_inlier_center to box center.
+  state_.prev_inlier_center = state_.center();
+  
+  // Initialize spatial prior grid if enabled.
+  if (config_.use_spatial_prior) {
+    state_.inlier_density_map = cv::Mat::zeros(3, 3, CV_32F);
+  }
+  
   initialized_ = true;
 }
 
@@ -590,6 +599,15 @@ float MotionBoxTracker::ScoreInliersSimilarity(
   float inlier_sum = 0;
   cv::Point2f inlier_center(0, 0);
   
+  // Initialize spatial prior grid if enabled.
+  cv::Mat density_map;
+  if (config_.use_spatial_prior) {
+    if (next_state.inlier_density_map.empty()) {
+      next_state.inlier_density_map = cv::Mat::zeros(3, 3, CV_32F);
+    }
+    density_map = cv::Mat::zeros(3, 3, CV_32F);
+  }
+  
   const float cos_r = std::cos(transform.rotation);
   const float sin_r = std::sin(transform.rotation);
 
@@ -609,6 +627,16 @@ float MotionBoxTracker::ScoreInliersSimilarity(
       ++inliers;
       inlier_sum += weights[i];
       inlier_center += vectors[i]->pos;
+      
+      // Update spatial density grid.
+      if (config_.use_spatial_prior && !density_map.empty()) {
+        cv::Point2f rel_pos = vectors[i]->pos - cv::Point2f(next_state.x, next_state.y);
+        int grid_x = std::min(2, std::max(0, int(rel_pos.x / next_state.width * 3)));
+        int grid_y = std::min(2, std::max(0, int(rel_pos.y / next_state.height * 3)));
+        if (grid_x >= 0 && grid_x < 3 && grid_y >= 0 && grid_y < 3) {
+          density_map.at<float>(grid_y, grid_x) += weights[i];
+        }
+      }
     }
   }
 
@@ -617,6 +645,29 @@ float MotionBoxTracker::ScoreInliersSimilarity(
 
   if (inliers > 0) {
     inlier_center *= (1.0f / inliers);
+    
+    // Temporal smoothing of inlier center.
+    cv::Point2f prev_center = state_.prev_inlier_center;
+    float prev_mag = cv::norm(prev_center);
+    if (prev_mag > 0.001f) {  // Check if prev_center was initialized.
+      float rel_change = cv::norm(inlier_center - prev_center) / 
+                        std::max(0.01f, std::max(state_.width, state_.height));
+      
+      float blend_weight = std::min(0.5f, rel_change * 2.0f);
+      blend_weight = std::max(0.1f, blend_weight);
+      
+      inlier_center = (1.0f - blend_weight) * inlier_center + 
+                      blend_weight * prev_center;
+    }
+    
+    // Store current inlier center for next frame.
+    next_state.prev_inlier_center = inlier_center;
+    
+    // Update spatial prior with temporal blending.
+    if (config_.use_spatial_prior && !density_map.empty()) {
+      next_state.inlier_density_map = 0.7f * density_map + 
+                                      0.3f * next_state.inlier_density_map;
+    }
 
     // Confidence based on inlier ratio and count.
     float inlier_ratio =
