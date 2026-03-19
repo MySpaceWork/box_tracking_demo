@@ -28,6 +28,7 @@ struct TrackedFeature {
   float irls_weight = 1.0f;   // IRLS weight after estimation.
   int track_id = -1;          // Unique track ID for long tracks.
   bool is_inlier = true;
+  int track_length = 0;       // Number of frames this feature has been tracked.
 };
 
 // Motion vector decomposed into background (camera) and object components.
@@ -57,6 +58,10 @@ struct BoxState {
   float confidence = 0;
   int num_inliers = 0;
   bool tracked = false;
+  
+  // Stage 2: Spatial prior and inlier center tracking.
+  cv::Mat inlier_density_map;  // 3x3 grid recording inlier density.
+  cv::Point2f prev_inlier_center;  // Previous frame's inlier center.
 
   cv::Point2f center() const {
     return cv::Point2f(x + width * 0.5f, y + height * 0.5f);
@@ -96,11 +101,19 @@ struct TrackerConfig {
 
   // Box tracking behavior.
   float min_inlier_ratio = 0.15f;
-  float spring_force = 0.1f;
+  float spring_force = 0.15f;              // Increased from 0.1
   float confidence_decay = 0.9f;
 
   // Forward-backward verification threshold (pixels).
-  float fb_verify_threshold = 2.0f;
+  float fb_verify_threshold = 1.5f;        // Decreased from 2.0
+  
+  // Stage 2: Advanced tracking features.
+  bool adaptive_spring_force = true;       // Enable adaptive spring force.
+  float spring_force_max = 0.25f;          // Maximum spring force.
+  float spring_force_min = 0.05f;          // Minimum spring force.
+  int max_track_length = 30;               // Maximum feature track length.
+  float temporal_smooth_weight = 0.3f;     // Weight for temporal smoothing.
+  bool use_spatial_prior = true;           // Enable spatial prior grid.
 };
 
 // Computes optical flow features between frames.
@@ -122,6 +135,7 @@ class FlowComputation {
   cv::Mat prev_gray_;
   std::vector<cv::Point2f> prev_points_;
   std::vector<int> prev_track_ids_;
+  std::vector<int> prev_track_lengths_;  // Track length for each feature.
   int next_track_id_ = 0;
   bool has_prev_ = false;
 };
