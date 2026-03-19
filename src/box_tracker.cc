@@ -24,6 +24,7 @@ void FlowComputation::Reset() {
   prev_gray_ = cv::Mat();
   prev_points_.clear();
   prev_track_ids_.clear();
+  prev_track_lengths_.clear();
   has_prev_ = false;
   next_track_id_ = 0;
 }
@@ -64,6 +65,7 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     gray_frame.copyTo(prev_gray_);
     ExtractGridFeatures(prev_gray_, prev_points_);
     prev_track_ids_.resize(prev_points_.size());
+    prev_track_lengths_.resize(prev_points_.size(), 0);
     for (size_t i = 0; i < prev_points_.size(); ++i) {
       prev_track_ids_[i] = next_track_id_++;
     }
@@ -75,6 +77,7 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     gray_frame.copyTo(prev_gray_);
     ExtractGridFeatures(prev_gray_, prev_points_);
     prev_track_ids_.resize(prev_points_.size());
+    prev_track_lengths_.resize(prev_points_.size(), 0);
     for (size_t i = 0; i < prev_points_.size(); ++i) {
       prev_track_ids_[i] = next_track_id_++;
     }
@@ -115,6 +118,14 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     feat.track_id = prev_track_ids_[i];
     feat.irls_weight = 1.0f;
     feat.is_inlier = true;
+    
+    // Stage 2: Update track length and apply length-based weighting.
+    feat.track_length = prev_track_lengths_[i] + 1;
+    if (feat.track_length > config_.max_track_length) {
+      // Reduce weight for overly long tracks to prevent drift.
+      feat.irls_weight *= 0.5f;
+    }
+    
     result.push_back(feat);
   }
 
@@ -155,10 +166,12 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
   // Keep tracked points and add new features in empty grid cells.
   std::vector<cv::Point2f> kept_points;
   std::vector<int> kept_ids;
+  std::vector<int> kept_lengths;
   for (const auto& f : result) {
     if (f.is_inlier) {
       kept_points.push_back(f.position);
       kept_ids.push_back(f.track_id);
+      kept_lengths.push_back(f.track_length);
     }
   }
 
@@ -181,12 +194,14 @@ std::vector<TrackedFeature> FlowComputation::ProcessFrame(
     if (!too_close && kept_points.size() < static_cast<size_t>(config_.max_features)) {
       kept_points.push_back(nf);
       kept_ids.push_back(next_track_id_++);
+      kept_lengths.push_back(0);  // New features start with length 0.
     }
   }
 
   gray_frame.copyTo(prev_gray_);
   prev_points_ = kept_points;
   prev_track_ids_ = kept_ids;
+  prev_track_lengths_ = kept_lengths;
 
   return result;
 }
