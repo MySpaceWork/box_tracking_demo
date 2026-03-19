@@ -52,6 +52,7 @@ struct BoxState {
   float rotation = 0;  // radians
   float dx = 0;        // velocity x
   float dy = 0;        // velocity y
+  float scale = 1.0f;  // Stage 3: scale factor
 
   // Tracking quality metrics.
   float confidence = 0;
@@ -96,11 +97,30 @@ struct TrackerConfig {
 
   // Box tracking behavior.
   float min_inlier_ratio = 0.15f;
-  float spring_force = 0.1f;
+  float spring_force = 0.15f;              // Optimized from 0.1
   float confidence_decay = 0.9f;
 
   // Forward-backward verification threshold (pixels).
-  float fb_verify_threshold = 2.0f;
+  float fb_verify_threshold = 1.5f;        // Optimized from 2.0
+  
+  // Stage 2: Advanced tracking features.
+  bool adaptive_spring_force = true;
+  float spring_force_max = 0.25f;
+  float spring_force_min = 0.05f;
+  int max_track_length = 30;
+  float temporal_smooth_weight = 0.3f;
+  bool use_spatial_prior = true;
+  
+  // Stage 3: Motion model selection.
+  enum class MotionModel {
+    TRANSLATION,    // Translation only (default, original).
+    SIMILARITY      // Translation + rotation + scale.
+  };
+  MotionModel motion_model = MotionModel::SIMILARITY;
+  bool allow_rotation = true;
+  bool allow_scale = true;
+  float min_scale = 0.8f;     // Minimum allowed scale.
+  float max_scale = 1.2f;     // Maximum allowed scale.
 };
 
 // Computes optical flow features between frames.
@@ -140,6 +160,13 @@ class CameraMotionEstimator {
   TrackerConfig config_;
 };
 
+// Stage 3: Similarity transform result.
+struct SimilarityTransform {
+  cv::Point2f translation;
+  float scale = 1.0f;
+  float rotation = 0.0f;
+};
+
 // Tracks a single box across frames using motion vectors.
 class MotionBoxTracker {
  public:
@@ -174,12 +201,25 @@ class MotionBoxTracker {
       const std::vector<const MotionVector*>& vectors,
       const std::vector<float>& prior_weights,
       std::vector<float>& weights);
+  
+  // Stage 3: IRLS similarity transform estimation.
+  SimilarityTransform EstimateSimilarity(
+      const std::vector<const MotionVector*>& vectors,
+      const std::vector<float>& prior_weights,
+      std::vector<float>& weights);
 
   // Score inliers and compute confidence.
   float ScoreInliers(
       const std::vector<const MotionVector*>& vectors,
       const std::vector<float>& weights,
       const cv::Point2f& translation,
+      BoxState& next_state);
+  
+  // Stage 3: Score inliers for similarity transform.
+  float ScoreInliersSimilarity(
+      const std::vector<const MotionVector*>& vectors,
+      const std::vector<float>& weights,
+      const SimilarityTransform& transform,
       BoxState& next_state);
 
   TrackerConfig config_;

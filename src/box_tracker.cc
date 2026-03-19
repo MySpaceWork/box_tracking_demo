@@ -7,6 +7,10 @@
 #include <cmath>
 #include <numeric>
 
+#ifdef USE_EIGEN3
+#include <Eigen/Dense>
+#endif
+
 namespace tracking {
 
 // ============================================================================
@@ -388,6 +392,256 @@ cv::Point2f MotionBoxTracker::EstimateTranslation(
   return translation;
 }
 
+// Stage 3: Estimate similarity transform (translation + rotation + scale).
+SimilarityTransform MotionBoxTracker::EstimateSimilarity(
+    const std::vector<const MotionVector*>& vectors,
+    const std::vector<float>& prior_weights, std::vector<float>& weights) {
+  const int n = vectors.size();
+  weights = prior_weights;
+  
+  SimilarityTransform result;
+  result.translation = cv::Point2f(0, 0);
+  result.scale = 1.0f;
+  result.rotation = 0.0f;
+  
+  if (n < 2) {
+    return result;
+  }
+
+#ifdef USE_EIGEN3
+  // Eigen3 implementation: more efficient.
+  for (int iter = 0; iter < config_.irls_iterations; ++iter) {
+    Eigen::Matrix4f A = Eigen::Matrix4f::Zero();
+    Eigen::Vector4f b = Eigen::Vector4f::Zero();
+    
+    for (int i = 0; i < n; ++i) {
+      float w = weights[i];
+      float x = vectors[i]->pos.x;
+      float y = vectors[i]->pos.y;
+      float dx = vectors[i]->object.x;
+      float dy = vectors[i]->object.y;
+      
+      // Build linear system for similarity: [a -b tx; b a ty]
+      // Row 1: a*x - b*y + tx = dx
+      A(0, 0) += w * x * x;
+      A(0, 1) -= w * x * y;
+      A(0, 2) += w * x;
+      A(1, 0) -= w * x * y;
+      A(1, 1) += w * y * y;
+      A(1, 2) += w * y;
+      A(2, 0) += w * x;
+      A(2, 1) -= w * y;
+      A(2, 2) += w;
+      
+      b(0) += w * x * dx;
+      b(1) -= w * y * dx;
+      b(2) += w * dx;
+      
+      // Row 2: b*x + a*y + ty = dy
+      A(0, 1) += w * x * y;
+      A(0, 3) += w * x;
+      A(1, 1) += w * y * y;
+      A(1, 3) += w * y;
+      A(3, 0) += w * x;
+      A(3, 1) += w * y;
+      A(3, 3) += w;
+      
+      b(0) += w * x * dy;
+      b(1) += w * y * dy;
+      b(3) += w * dy;
+    }
+    
+    // Solve using LDLT decomposition.
+    Eigen::Vector4f solution = A.ldlt().solve(b);
+    float a = solution(0);
+    float b_val = solution(1);
+    
+    result.translation.x = solution(2);
+    result.translation.y = solution(3);
+    result.scale = std::sqrt(a * a + b_val * b_val);
+    result.rotation = std::atan2(b_val, a);
+    
+    // Clamp scale if enabled.
+    if (config_.allow_scale) {
+      result.scale = std::max(config_.min_scale, 
+                             std::min(config_.max_scale, result.scale));
+    } else {
+      result.scale = 1.0f;
+    }
+    
+    if (!config_.allow_rotation) {
+      result.rotation = 0.0f;
+    }
+    
+    // Update IRLS weights based on residual.
+    for (int i = 0; i < n; ++i) {
+      cv::Point2f pos = vectors[i]->pos;
+      cv::Point2f obj = vectors[i]->object;
+      
+      // Compute expected motion from similarity transform.
+      float cos_r = std::cos(result.rotation);
+      float sin_r = std::sin(result.rotation);
+      cv::Point2f expected(
+          result.scale * (cos_r * pos.x - sin_r * pos.y) - pos.x + result.translation.x,
+          result.scale * (sin_r * pos.x + cos_r * pos.y) - pos.y + result.translation.y);
+      
+      float residual = cv::norm(obj - expected);
+      weights[i] = prior_weights[i] / std::max(1e-6f, residual);
+    }
+    
+    // Normalize weights.
+    float wsum = 0;
+    for (float w : weights) wsum += w;
+    if (wsum > 0) {
+      for (float& w : weights) w /= wsum;
+    }
+  }
+#else
+  // OpenCV implementation: slower but no extra dependency.
+  for (int iter = 0; iter < config_.irls_iterations; ++iter) {
+    cv::Mat A = cv::Mat::zeros(2 * n, 4, CV_32F);
+    cv::Mat b = cv::Mat::zeros(2 * n, 1, CV_32F);
+    
+    for (int i = 0; i < n; ++i) {
+      float w = std::sqrt(weights[i]);
+      float x = vectors[i]->pos.x;
+      float y = vectors[i]->pos.y;
+      float dx = vectors[i]->object.x;
+      float dy = vectors[i]->object.y;
+      
+      // Row 1: a*x - b*y + tx = dx
+      A.at<float>(2*i, 0) = w * x;
+      A.at<float>(2*i, 1) = w * (-y);
+      A.at<float>(2*i, 2) = w;
+      A.at<float>(2*i, 3) = 0;
+      b.at<float>(2*i, 0) = w * dx;
+      
+      // Row 2: b*x + a*y + ty = dy
+      A.at<float>(2*i+1, 0) = w * y;
+      A.at<float>(2*i+1, 1) = w * x;
+      A.at<float>(2*i+1, 2) = 0;
+      A.at<float>(2*i+1, 3) = w;
+      b.at<float>(2*i+1, 0) = w * dy;
+    }
+    
+    cv::Mat solution;
+    if (!cv::solve(A, b, solution, cv::DECOMP_QR)) {
+      // Fallback to translation-only if solve fails.
+      return EstimateTranslation(vectors, prior_weights, weights);
+    }
+    
+    float a = solution.at<float>(0);
+    float b_val = solution.at<float>(1);
+    
+    result.translation.x = solution.at<float>(2);
+    result.translation.y = solution.at<float>(3);
+    result.scale = std::sqrt(a * a + b_val * b_val);
+    result.rotation = std::atan2(b_val, a);
+    
+    // Clamp scale if enabled.
+    if (config_.allow_scale) {
+      result.scale = std::max(config_.min_scale, 
+                             std::min(config_.max_scale, result.scale));
+    } else {
+      result.scale = 1.0f;
+    }
+    
+    if (!config_.allow_rotation) {
+      result.rotation = 0.0f;
+    }
+    
+    // Update IRLS weights.
+    for (int i = 0; i < n; ++i) {
+      cv::Point2f pos = vectors[i]->pos;
+      cv::Point2f obj = vectors[i]->object;
+      
+      float cos_r = std::cos(result.rotation);
+      float sin_r = std::sin(result.rotation);
+      cv::Point2f expected(
+          result.scale * (cos_r * pos.x - sin_r * pos.y) - pos.x + result.translation.x,
+          result.scale * (sin_r * pos.x + cos_r * pos.y) - pos.y + result.translation.y);
+      
+      float residual = cv::norm(obj - expected);
+      weights[i] = prior_weights[i] / std::max(1e-6f, residual);
+    }
+    
+    // Normalize.
+    float wsum = 0;
+    for (float w : weights) wsum += w;
+    if (wsum > 0) {
+      for (float& w : weights) w /= wsum;
+    }
+  }
+#endif
+  
+  return result;
+}
+
+// Stage 3: Score inliers for similarity transform.
+float MotionBoxTracker::ScoreInliersSimilarity(
+    const std::vector<const MotionVector*>& vectors,
+    const std::vector<float>& weights, const SimilarityTransform& transform,
+    BoxState& next_state) {
+  int inliers = 0;
+  float inlier_sum = 0;
+  cv::Point2f inlier_center(0, 0);
+  
+  const float cos_r = std::cos(transform.rotation);
+  const float sin_r = std::sin(transform.rotation);
+
+  for (size_t i = 0; i < vectors.size(); ++i) {
+    cv::Point2f pos = vectors[i]->pos;
+    cv::Point2f obj = vectors[i]->object;
+    
+    // Expected motion from similarity transform.
+    cv::Point2f expected(
+        transform.scale * (cos_r * pos.x - sin_r * pos.y) - pos.x + transform.translation.x,
+        transform.scale * (sin_r * pos.x + cos_r * pos.y) - pos.y + transform.translation.y);
+    
+    float residual = cv::norm(obj - expected);
+    bool is_inlier = (residual < 0.03f);
+
+    if (is_inlier) {
+      ++inliers;
+      inlier_sum += weights[i];
+      inlier_center += vectors[i]->pos;
+    }
+  }
+
+  next_state.num_inliers = inliers;
+  float confidence = 0;
+
+  if (inliers > 0) {
+    inlier_center *= (1.0f / inliers);
+
+    // Confidence based on inlier ratio and count.
+    float inlier_ratio =
+        static_cast<float>(inliers) / std::max(1, (int)vectors.size());
+    confidence = std::min(1.0f, inlier_ratio / config_.min_inlier_ratio);
+
+    // Apply spring force toward inlier center.
+    cv::Point2f box_center = next_state.center();
+    cv::Point2f diff = inlier_center - box_center;
+    float diff_mag = cv::norm(diff);
+    
+    // Adaptive spring force.
+    float spring_force = config_.spring_force;
+    if (config_.adaptive_spring_force) {
+      float confidence_factor = 1.0f - confidence;
+      spring_force = config_.spring_force_min + 
+                    (config_.spring_force_max - config_.spring_force_min) * 
+                    confidence_factor;
+    }
+    
+    if (diff_mag > 0.01f) {
+      next_state.x += diff.x * spring_force;
+      next_state.y += diff.y * spring_force;
+    }
+  }
+
+  return confidence;
+}
+
 float MotionBoxTracker::ScoreInliers(
     const std::vector<const MotionVector*>& vectors,
     const std::vector<float>& weights, const cv::Point2f& translation,
@@ -456,19 +710,53 @@ BoxState MotionBoxTracker::TrackStep(const FrameTrackingData& data,
   // Step 2: RANSAC initialization.
   RansacTranslationInit(selected, prior_weights);
 
-  // Step 3: IRLS translation estimation.
+  // Step 3 & 4: Motion estimation and application.
   std::vector<float> weights;
-  cv::Point2f translation =
-      EstimateTranslation(selected, prior_weights, weights);
-
-  // Step 4: Apply motion to box.
-  next_state.x += translation.x;
-  next_state.y += translation.y;
-  next_state.dx = translation.x;
-  next_state.dy = translation.y;
-
-  // Step 5: Score inliers and compute confidence.
-  float confidence = ScoreInliers(selected, weights, translation, next_state);
+  float confidence = 0;
+  
+  if (config_.motion_model == TrackerConfig::MotionModel::SIMILARITY) {
+    // Stage 3: Use similarity transform (translation + rotation + scale).
+    SimilarityTransform transform =
+        EstimateSimilarity(selected, prior_weights, weights);
+    
+    // Apply similarity transform to box.
+    cv::Point2f box_center = next_state.center();
+    
+    // Apply scale.
+    if (config_.allow_scale && std::abs(transform.scale - 1.0f) < 0.5f) {
+      next_state.width *= transform.scale;
+      next_state.height *= transform.scale;
+      next_state.scale = transform.scale;
+    }
+    
+    // Apply rotation around center.
+    if (config_.allow_rotation && std::abs(transform.rotation) < M_PI / 4) {
+      next_state.rotation += transform.rotation;
+    }
+    
+    // Apply translation.
+    next_state.x += transform.translation.x;
+    next_state.y += transform.translation.y;
+    next_state.dx = transform.translation.x;
+    next_state.dy = transform.translation.y;
+    
+    // Step 5: Score inliers with similarity model.
+    confidence = ScoreInliersSimilarity(selected, weights, transform, next_state);
+  } else {
+    // Original: Translation-only model.
+    cv::Point2f translation =
+        EstimateTranslation(selected, prior_weights, weights);
+    
+    // Apply translation to box.
+    next_state.x += translation.x;
+    next_state.y += translation.y;
+    next_state.dx = translation.x;
+    next_state.dy = translation.y;
+    
+    // Step 5: Score inliers.
+    confidence = ScoreInliers(selected, weights, translation, next_state);
+  }
+  
   next_state.confidence = confidence;
   next_state.tracked = (confidence > 0.1f);
 
