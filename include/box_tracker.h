@@ -28,6 +28,7 @@ struct TrackedFeature {
   float irls_weight = 1.0f;   // IRLS weight after estimation.
   int track_id = -1;          // Unique track ID for long tracks.
   bool is_inlier = true;
+  int track_length = 0;       // Stage 2: Number of frames tracked.
 };
 
 // Motion vector decomposed into background (camera) and object components.
@@ -58,6 +59,10 @@ struct BoxState {
   float confidence = 0;
   int num_inliers = 0;
   bool tracked = false;
+  
+  // Stage 2 & 3: Spatial prior and inlier center tracking.
+  cv::Mat inlier_density_map;      // 3x3 grid recording inlier density.
+  cv::Point2f prev_inlier_center;  // Previous frame's inlier center.
 
   cv::Point2f center() const {
     return cv::Point2f(x + width * 0.5f, y + height * 0.5f);
@@ -142,6 +147,7 @@ class FlowComputation {
   cv::Mat prev_gray_;
   std::vector<cv::Point2f> prev_points_;
   std::vector<int> prev_track_ids_;
+  std::vector<int> prev_track_lengths_;  // Stage 2: Track length for each feature.
   int next_track_id_ = 0;
   bool has_prev_ = false;
 };
